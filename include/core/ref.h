@@ -35,8 +35,11 @@ std::vector<WRef<T>> refs_to_wrefs(const std::vector<Ref<T>> &refs) {
 template <typename T>
 std::vector<Ref<T>> wrefs_to_refs(const std::vector<WRef<T>> &wrefs) {
     std::vector<Ref<T>> refs;
-    for (const auto &wref : wrefs)
-        refs.emplace_back(wref);
+    for (const auto &wref : wrefs) {
+        if (auto ref = wref.lock()) {
+            refs.emplace_back(ref);
+        }
+    }
     return refs;
 }
 

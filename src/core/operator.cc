@@ -54,14 +54,16 @@ namespace infini
             auto dataTypes = inferDataType();
             for (size_t i = 0; i < outputs.size(); i++)
             {
-                IT_ASSERT(!outputs[i], "Find empty output while operator creation");
-                outputs[i] = graph->addTensor(shapes[i], dataTypes[i]);
+                if (outputs[i] == nullptr) {
+                    outputs[i] = graph->addTensor(shapes[i], dataTypes[i]);
+                }
             }
         }
         else
         { // if outputs have been created, check their shapes
             for (size_t i = 0; i < shapes.size(); ++i)
             {
+                if (!outputs[i]) return false;
                 if (shapes[i] != outputs[i]->getDims())
                     return false;
             }

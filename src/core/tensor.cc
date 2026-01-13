@@ -24,8 +24,11 @@ namespace infini {
                      ", dtype " + dtype.toString() + ", " + runtime->toString() +
                      ", " + ss.str() + "\n";
         vector<UidBaseType> targetGuids;
-        for (const auto &op : targets)
-            targetGuids.emplace_back(op.lock()->getGuid());
+        for (const auto &op : targets) {
+            if (auto lockedOp = op.lock()) {
+                targetGuids.emplace_back(lockedOp->getGuid());
+            }
+        }
         if (auto o = source.lock())
             ret += ", source " + std::to_string(o->getGuid());
         else

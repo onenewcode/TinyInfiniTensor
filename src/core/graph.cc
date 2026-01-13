@@ -1,5 +1,7 @@
 #include "core/graph.h"
 #include "core/blob.h"
+#include "operators/transpose.h"
+#include "operators/matmul.h"
 #include <algorithm>
 #include <numeric>
 #include <queue>
@@ -107,6 +109,132 @@ namespace infini
         // 1. 去除冗余的算子（例如，两个相邻的算子都是 transpose 算子，且做的是相反的操作，可以将其全部删除）
         // 2. 合并算子（例如，矩阵乘算子中含有属性transA、transB，如果其输入存在transpose，且对最后两个维度做交换，就可以将transpose融入到矩阵乘算子的属性中去）
         // =================================== 作业 ===================================
+        
+        // 第一轮：消除相反的transpose
+        for (size_t i = 0; i < ops.size(); ++i) {
+            auto op = ops[i];
+            if (op->getOpType() != OpType::Transpose) continue;
+            
+            auto transposeOp = as<TransposeObj>(op);
+            auto input = transposeOp->getInputs()[0];
+            auto output = transposeOp->getOutput();
+            auto permute = transposeOp->getPermute();
+            
+            auto sourceOp = input->getSource();
+            if (!sourceOp) continue;
+            if (sourceOp->getOpType() != OpType::Transpose) continue;
+            
+            auto prevTranspose = as<TransposeObj>(sourceOp);
+            auto prevPermute = prevTranspose->getPermute();
+            
+            bool isInverse = true;
+            for (size_t j = 0; j < permute.size() && j < prevPermute.size(); ++j) {
+                if (permute[prevPermute[j]] != j) {
+                    isInverse = false;
+                    break;
+                }
+            }
+            
+            if (isInverse) {
+                auto prevInput = prevTranspose->getInputs()[0];
+                auto prevOutput = prevTranspose->getOutput();
+                
+                for (auto target : output->getTargets()) {
+                    target->replaceInput(output, prevInput);
+                }
+                
+                // 清理前驱/后继关系
+                for (auto suc : prevTranspose->getSuccessors()) {
+                    auto it = std::find(suc->getPredecessors().begin(), suc->getPredecessors().end(), prevTranspose);
+                    if (it != suc->getPredecessors().end()) {
+                        suc->getPredecessors().erase(it);
+                    }
+                }
+                for (auto suc : transposeOp->getSuccessors()) {
+                    auto it = std::find(suc->getPredecessors().begin(), suc->getPredecessors().end(), transposeOp);
+                    if (it != suc->getPredecessors().end()) {
+                        suc->getPredecessors().erase(it);
+                    }
+                }
+                
+                prevTranspose->getSuccessors().clear();
+                transposeOp->getSuccessors().clear();
+                prevTranspose->getPredecessors().clear();
+                transposeOp->getPredecessors().clear();
+                
+                removeOperator(prevTranspose);
+                removeOperator(transposeOp);
+                removeTensor(prevOutput);
+                removeTensor(output);
+                
+                // 重新开始
+                i = 0;
+            }
+        }
+        
+        // 第二轮：融合transpose到matmul
+        for (size_t i = 0; i < ops.size(); ++i) {
+            auto op = ops[i];
+            if (op->getOpType() != OpType::MatMul) continue;
+            
+            auto matmulOp = as<MatmulObj>(op);
+            
+            for (int j = 0; j < 2; ++j) {
+                auto input = matmulOp->getInputs(j);
+                if (!input) continue;
+                
+                auto sourceOp = input->getSource();
+                if (!sourceOp) continue;
+                if (sourceOp->getOpType() != OpType::Transpose) continue;
+                
+                auto transposeOp = as<TransposeObj>(sourceOp);
+                auto permute = transposeOp->getPermute();
+                auto inputShape = input->getDims();
+                int rank = inputShape.size();
+                
+                if (rank < 2) continue;
+                
+                bool swapsLastTwo = (permute[rank - 2] == rank - 1) && 
+                                   (permute[rank - 1] == rank - 2);
+                bool keepsOthers = true;
+                for (int k = 0; k < rank - 2; ++k) {
+                    if (permute[k] != k) {
+                        keepsOthers = false;
+                        break;
+                    }
+                }
+                
+                if (swapsLastTwo && keepsOthers) {
+                    auto transposeInput = transposeOp->getInputs()[0];
+                    if (!transposeInput) continue;
+                    
+                    matmulOp->replaceInput(input, transposeInput);
+                    
+                    if (j == 0) {
+                        matmulOp->setTransA(!matmulOp->getTransA());
+                    } else {
+                        matmulOp->setTransB(!matmulOp->getTransB());
+                    }
+                    
+                    // 清理前驱/后继关系
+                    for (auto suc : transposeOp->getSuccessors()) {
+                        auto it = std::find(suc->getPredecessors().begin(), suc->getPredecessors().end(), transposeOp);
+                        if (it != suc->getPredecessors().end()) {
+                            suc->getPredecessors().erase(it);
+                        }
+                    }
+                    transposeOp->getSuccessors().clear();
+                    transposeOp->getPredecessors().clear();
+                    
+                    removeOperator(transposeOp);
+                    removeTensor(input);
+                    
+                    // 重新开始
+                    i = 0;
+                    break;
+                }
+            }
+        }
     }
 
     Tensor GraphObj::getTensor(int fuid) const
@@ -132,6 +260,7 @@ namespace infini
             // replace the old outputshape and size with new one
             for (int i = 0; i < (int)ans.value().size(); ++i)
             {
+                if (!oldOutputs[i]) continue;
                 auto newShape = ans.value()[i];
                 auto oldShape = oldOutputs[i]->getDims();
                 auto fuid = oldOutputs[i]->getFuid();
@@ -154,14 +283,22 @@ namespace infini
         // HINT: 获取分配好的内存指针后，可以调用 tensor 的 setDataBlob 函数给 tensor 绑定内存
         // =================================== 作业 ===================================
         
-        void *base_ptr = allocator.getPtr();
+        shape_infer();
+        
+        std::vector<size_t> offsets;
+        offsets.reserve(tensors.size());
         
         for (auto &tensor : tensors) {
             size_t size = tensor->getBytes();
-            size_t offset = allocator.alloc(size);
-            void *tensor_ptr = static_cast<char *>(base_ptr) + offset;
+            offsets.push_back(allocator.alloc(size));
+        }
+        
+        void *base_ptr = allocator.getPtr();
+        
+        for (size_t i = 0; i < tensors.size(); ++i) {
+            void *tensor_ptr = static_cast<char *>(base_ptr) + offsets[i];
             Blob blob = make_ref<BlobObj>(runtime, tensor_ptr);
-            tensor->setDataBlob(blob);
+            tensors[i]->setDataBlob(blob);
         }
 
         allocator.info();
