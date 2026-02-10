@@ -1,5 +1,6 @@
 name: Build and test cpu
 on:
+  workflow_dispatch:  # 这一行是允许手动触发的关键
   push:
     paths-ignore:
       - '**.md'
